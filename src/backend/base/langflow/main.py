@@ -16,6 +16,7 @@ import anyio
 import httpx
 import sqlalchemy
 from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi_pagination import add_pagination
@@ -37,6 +38,7 @@ from langflow.api import log_router
 from langflow.api.health_check_router import health_check_router
 from langflow.api.router import router
 from langflow.api.v1.mcp_projects import init_mcp_servers
+from langflow.api.validation_errors import request_validation_exception_handler
 from langflow.api.warm_graph import is_warm_registry_enabled
 from langflow.cli.preflight import PreflightAbortError, ensure_production_preflight
 from langflow.initial_setup.setup import (
@@ -196,7 +198,12 @@ def get_lifespan(*, fix_migration=False, version=None):
     async def lifespan(_app: FastAPI):
         from lfx.interface.components import component_cache, get_and_cache_all_types_dict
 
-        from langflow.preload import PreloadStep, get_owned_temp_dirs, is_step_complete
+        from langflow.preload import (
+            PreloadStep,
+            get_owned_temp_dirs,
+            initialize_environment_variables,
+            is_step_complete,
+        )
 
         configure()
 
@@ -259,6 +266,7 @@ def get_lifespan(*, fix_migration=False, version=None):
             # Even when preload state is inherited via fork, initialize_services() must run
             # so each worker rebuilds its own connection pool (idempotent otherwise).
             await initialize_services(fix_migration=fix_migration)
+            await initialize_environment_variables()
             await logger.adebug(f"Services initialized in {asyncio.get_event_loop().time() - start_time:.2f}s")
 
             # Surface env-driven pgVector so operators can confirm the deployment
@@ -1030,6 +1038,10 @@ def create_app():
 
     # Discover and register additional routers from plugins (langflow.plugins entry-point)
     load_plugin_routes(app)
+
+    # Replaces FastAPI's default 422 handler, which echoes each submitted value
+    # (credentials included) back in the error body.
+    app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
     @app.exception_handler(DeploymentGuardError)
     async def deployment_guard_exception_handler(_request: Request, exc: DeploymentGuardError):
